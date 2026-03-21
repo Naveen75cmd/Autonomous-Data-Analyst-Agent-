@@ -57,19 +57,29 @@ AVAILABLE_MODELS = {
     "mixtral-8x7b-32768"      : "Mixtral · 8×7B   —  32k context window",
 }
 
-# Prefix injected into every agent call — teaches the LLM how to handle charts
-AGENT_PREFIX = (
-    "You are an expert senior data analyst. "
-    "You have access to a pandas DataFrame called `df`. "
-    "Think step-by-step and be concise and precise in your answers. "
-    "When the user asks for a chart, graph, plot, or any visualisation:\n"
-    "  1. Write Python code using matplotlib or seaborn.\n"
-    f"  2. Save the figure with: plt.savefig('{CHART_TEMP_PATH}', "
-    "bbox_inches='tight', dpi=150)\n"
-    "  3. Never call plt.show().\n"
-    "  4. Always call plt.close() after saving.\n"
-    "For all other questions, provide a clear, structured, human-readable answer."
-)
+# Prefix injected into every agent call.
+# CRITICAL RULES enforce strict ReAct format so the parser never sees a
+# "Final Answer" and an "Action" in the same response turn.
+AGENT_PREFIX = """You are an expert senior data analyst with access to a pandas DataFrame called `df`.
+
+STRICT OUTPUT FORMAT RULES — follow these exactly or the system will break:
+1. Each response turn must contain EITHER an Action OR a Final Answer — NEVER both.
+2. If you need to run code, output ONLY the Action/Action Input block. Wait for the Observation.
+3. Only output "Final Answer:" after you have all the information you need. Never include an Action after Final Answer.
+4. Do not combine analysis text with an Action in the same turn.
+
+VISUALIZATION RULES — when asked for any chart, graph or plot:
+- Use matplotlib or seaborn only.
+- Save with: plt.savefig('""" + CHART_TEMP_PATH + """', bbox_inches='tight', dpi=150)
+- Never call plt.show().
+- Always call plt.close() after saving.
+- Do NOT describe the chart in text AND run code in the same turn.
+
+ANSWER RULES:
+- Be concise, precise, and structured.
+- Use markdown formatting (bold, lists) where helpful.
+- State numbers with 2 decimal places where appropriate.
+"""
 
 # ---------------------------------------------------------------------------
 # Logger
@@ -609,15 +619,26 @@ def build_agent(df: pd.DataFrame, api_key: str, model: str = DEFAULT_MODEL):
             temperature=0,       # Deterministic code generation
             max_tokens=4096,
         )
+        def _on_parse_error(error: Exception) -> str:
+            """Feed parse errors back to the LLM so it self-corrects."""
+            return (
+                "Your previous response could not be parsed. "
+                "Remember: output ONLY an Action/Action Input block OR a Final Answer "
+                "— never both in the same turn. "
+                f"The parsing error was: {error}"
+            )
+
         agent = create_pandas_dataframe_agent(
             llm=llm,
             df=df,
             agent_type=AGENT_TYPE_ZERO_SHOT,
             verbose=True,
             allow_dangerous_code=True,
-            handle_parsing_errors=True,
+            handle_parsing_errors=_on_parse_error,   # callable gives LLM self-correction hint
             prefix=AGENT_PREFIX,
             return_intermediate_steps=False,
+            max_iterations=8,           # prevent infinite loops
+            max_execution_time=120,     # 2-minute hard timeout
         )
         logger.info("Agent ready — model: %s", model)
         return agent
